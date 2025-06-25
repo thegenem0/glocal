@@ -1,0 +1,36 @@
+server:
+  port: 9999
+  host: "0.0.0.0"
+services:
+  storage:
+    enabled: true
+    container: "minio"
+    config:
+      access_key: "minioadmin"
+      secret_key: "minioadmin"
+  bigquery:
+    enabled: false
+    container: "clickhouse"
+  pubsub:
+    enabled: false
+    container: "pulsar"
+containers:
+  minio:
+    image: "minio/minio:latest"
+    ports: [9000, 9001]
+    environment:
+      MINIO_ROOT_USER: "minioadmin"
+      MINIO_ROOT_PASSWORD: "minioadmin"
+    wait_for:
+      port: 9000
+  clickhouse:
+    image: "clickhouse/clickhouse-server:latest"
+    ports: [8123, 9000]
+    wait_for:
+      port: 8123
+      path: "/ping"
+  pulsar:
+    image: "apachepulsar/pulsar:latest"
+    ports: [6650, 8080]
+    wait_for:
+      port: 8080
