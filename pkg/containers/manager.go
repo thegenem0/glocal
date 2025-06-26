@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"maps"
+
 	"github.com/docker/go-connections/nat"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -65,7 +67,7 @@ func (cm *ContainerManager) StartContainer(ctx context.Context, name string, cfg
 
 	req, err := cm.buildContainerRequest(cfg)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build container request: %w", name, err)
+		return nil, fmt.Errorf("failed to build container request: %w", err)
 	}
 
 	containerInfo := &ContainerInfo{
@@ -96,7 +98,7 @@ func (cm *ContainerManager) StartContainer(ctx context.Context, name string, cfg
 	}
 
 	for _, internalPort := range cfg.Ports {
-		configPort, err := nat.NewPort("tcp", string(internalPort))
+		configPort, err := nat.NewPort("tcp", fmt.Sprint(internalPort))
 		if err != nil {
 			containerInfo.Status = StatusError
 			return nil, fmt.Errorf("failed to parse %d as nat.Port: %w", internalPort, err)
@@ -133,6 +135,10 @@ func (cm *ContainerManager) GetContainer(name string) (*ContainerInfo, bool) {
 	return container, exists
 }
 
+func (cm *ContainerManager) GetRegistry() *ContainerRegistry {
+	return cm.registry
+}
+
 func (cm *ContainerManager) GetContainerEndpoint(name string, internalPort int) (string, error) {
 	containerInfo, exists := cm.GetContainer(name)
 	if !exists {
@@ -153,9 +159,7 @@ func (cm *ContainerManager) ListContainers() map[string]*ContainerInfo {
 	defer cm.mu.Unlock()
 
 	result := make(map[string]*ContainerInfo)
-	for name, info := range cm.containers {
-		result[name] = info
-	}
+	maps.Copy(result, cm.containers)
 
 	return result
 }
@@ -211,10 +215,11 @@ func (cm *ContainerManager) buildContainerRequest(cfg config.ContainerConfig) (*
 		Image:        cfg.Image,
 		ExposedPorts: exposedPorts,
 		Env:          cfg.Environment,
+		Cmd:          cfg.Cmd,
 	}
 
 	if cfg.WaitFor.Port > 0 {
-		port, err := nat.NewPort("tcp", string(cfg.WaitFor.Port))
+		port, err := nat.NewPort("tcp", fmt.Sprint(cfg.WaitFor.Port))
 		if cfg.WaitFor.Path != "" {
 			if err != nil {
 				return nil, err

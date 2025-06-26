@@ -1,0 +1,1123 @@
+// File: pkg/containers/health.go
+package containers
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"sync"
+	"time"
+
+	"go.uber.org/zap"
+)
+
+type ContainerHealthChecker struct {
+	containers map[string]*ContainerInfo
+	mu         sync.RWMutex
+	logger     *zap.Logger
+	client     *http.Client
+}
+
+func NewContainerHealthChecker(logger *zap.Logger) *ContainerHealthChecker {
+	return &ContainerHealthChecker{
+		containers: make(map[string]*ContainerInfo),
+		logger:     logger,
+		client: &http.Client{
+			Timeout: 5 * time.Second,
+		},
+	}
+}
+
+func (hc *ContainerHealthChecker) RegisterContainer(name string, containerInfo *ContainerInfo) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+
+	hc.containers[name] = containerInfo
+}
+
+func (hc *ContainerHealthChecker) DeregisterContainer(name string) {
+	hc.mu.Lock()
+	defer hc.mu.Unlock()
+
+	delete(hc.containers, name)
+}
+
+func (hc *ContainerHealthChecker) CheckHealth(ctx context.Context, name string) error {
+	hc.mu.RLock()
+	containerInfo, exists := hc.containers[name]
+	hc.mu.RUnlock()
+
+	if !exists {
+		return fmt.Errorf("container %s not registered for health checking", name)
+	}
+
+	if containerInfo.Status != StatusRunning {
+		return fmt.Errorf("container %s is not running (status: %s)", name, containerInfo.Status)
+	}
+
+	// If container had a health check endpoint
+	if containerInfo.Config.WaitFor.Path != "" && containerInfo.Config.WaitFor.Port > 0 {
+		return hc.checkHTTPHealth(ctx, containerInfo)
+	}
+
+	// Otherwise just check if container is up
+	return hc.checkContainerRunning(containerInfo)
+}
+
+func (hc *ContainerHealthChecker) CheckAllHealth(ctx context.Context) map[string]error {
+	hc.mu.RLock()
+	containers := make(map[string]*ContainerInfo)
+	for name, info := range hc.containers {
+		containers[name] = info
+	}
+	hc.mu.RUnlock()
+
+	results := make(map[string]error)
+	for name := range containers {
+		results[name] = hc.CheckHealth(ctx, name)
+	}
+
+	return results
+}
+
+func (hc *ContainerHealthChecker) checkHTTPHealth(ctx context.Context, containerInfo *ContainerInfo) error {
+	port := containerInfo.Config.WaitFor.Port
+	externalPort, exists := containerInfo.Ports[port]
+	if !exists {
+		return fmt.Errorf("health check port %d not found", port)
+	}
+
+	url := fmt.Sprintf("http://%s:%d%s", containerInfo.Host, externalPort, containerInfo.Config.WaitFor.Path)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return fmt.Errorf("failed to create health check request: %w", err)
+	}
+
+	resp, err := hc.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("health check request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("health check returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (hc *ContainerHealthChecker) checkContainerRunning(containerInfo *ContainerInfo) error {
+	running := containerInfo.Container.IsRunning()
+
+	if !running {
+		return fmt.Errorf("container is not running")
+	}
+
+	return nil
+}
+
+
+
+// File: pkg/containers/manager.go
+package containers
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+
+	"maps"
+
+	"github.com/docker/go-connections/nat"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/wait"
+	"github.com/thegenem0/glocal/pkg/config"
+	"go.uber.org/zap"
+)
+
+type ContainerStatus string
+
+const (
+	StatusStarting ContainerStatus = "starting"
+	StatusRunning  ContainerStatus = "running"
+	StatusStopping ContainerStatus = "stopping"
+	StatusStopped  ContainerStatus = "stopped"
+	StatusError    ContainerStatus = "error"
+)
+
+type ContainerManager struct {
+	containers map[string]*ContainerInfo
+	registry   *ContainerRegistry
+	health     *ContainerHealthChecker
+	mu         sync.RWMutex
+	logger     *zap.Logger
+}
+
+type ContainerInfo struct {
+	Container testcontainers.Container
+	Host      string
+	Ports     map[int]int // internal -> external mapping
+	Name      string
+	Image     string
+	Status    ContainerStatus
+	StartedAt time.Time
+	Config    config.ContainerConfig
+}
+
+func NewContainerManager(logger *zap.Logger) *ContainerManager {
+	return &ContainerManager{
+		containers: make(map[string]*ContainerInfo),
+		registry:   NewContainerRegistry(),
+		health:     NewContainerHealthChecker(logger),
+		logger:     logger,
+	}
+}
+
+func (cm *ContainerManager) StartContainer(ctx context.Context, name string, cfg config.ContainerConfig) (*ContainerInfo, error) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	if _, exists := cm.containers[name]; exists {
+		return nil, fmt.Errorf("container %s already exists", name)
+	}
+
+	cm.logger.Info("Starting container",
+		zap.String("name", name),
+		zap.String("image", cfg.Image))
+
+	req, err := cm.buildContainerRequest(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build container request: %w", err)
+	}
+
+	containerInfo := &ContainerInfo{
+		Name:      name,
+		Image:     cfg.Image,
+		Status:    StatusStarting,
+		Config:    cfg,
+		Ports:     make(map[int]int),
+		StartedAt: time.Now(),
+	}
+
+	cm.containers[name] = containerInfo
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: *req,
+		Started:          true,
+	})
+
+	if err != nil {
+		containerInfo.Status = StatusError
+		return nil, fmt.Errorf("failed to start container %s: %w", name, err)
+	}
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		containerInfo.Status = StatusError
+		return nil, fmt.Errorf("failed to get container host: %w", err)
+	}
+
+	for _, internalPort := range cfg.Ports {
+		configPort, err := nat.NewPort("tcp", fmt.Sprint(internalPort))
+		if err != nil {
+			containerInfo.Status = StatusError
+			return nil, fmt.Errorf("failed to parse %d as nat.Port: %w", internalPort, err)
+		}
+
+		mappedPort, err := container.MappedPort(ctx, configPort)
+		if err != nil {
+			containerInfo.Status = StatusError
+			return nil, fmt.Errorf("failed to get mapped port %d: %w", internalPort, err)
+		}
+
+		containerInfo.Ports[internalPort] = mappedPort.Int()
+	}
+
+	containerInfo.Container = container
+	containerInfo.Host = host
+	containerInfo.Status = StatusRunning
+
+	cm.health.RegisterContainer(name, containerInfo)
+
+	cm.logger.Info("Container started successfully",
+		zap.String("name", name),
+		zap.String("host", host),
+		zap.Any("ports", containerInfo.Ports))
+
+	return containerInfo, nil
+}
+
+func (cm *ContainerManager) GetContainer(name string) (*ContainerInfo, bool) {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	container, exists := cm.containers[name]
+	return container, exists
+}
+
+func (cm *ContainerManager) GetRegistry() *ContainerRegistry {
+	return cm.registry
+}
+
+func (cm *ContainerManager) GetContainerEndpoint(name string, internalPort int) (string, error) {
+	containerInfo, exists := cm.GetContainer(name)
+	if !exists {
+		return "", fmt.Errorf("container %s not found", name)
+	}
+
+	externalPort, exists := containerInfo.Ports[internalPort]
+	if !exists {
+		return "", fmt.Errorf("port %d not found for container %s", internalPort, name)
+
+	}
+
+	return fmt.Sprintf("http://%s:%d", containerInfo.Host, externalPort), nil
+}
+
+func (cm *ContainerManager) ListContainers() map[string]*ContainerInfo {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	result := make(map[string]*ContainerInfo)
+	maps.Copy(result, cm.containers)
+
+	return result
+}
+
+func (cm *ContainerManager) StopContainer(ctx context.Context, name string) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	containerInfo, exists := cm.containers[name]
+	if !exists {
+		return fmt.Errorf("container %s not found", name)
+	}
+
+	cm.logger.Info("Stopping container", zap.String("name", name))
+	containerInfo.Status = StatusStopping
+
+	cm.health.DeregisterContainer(name)
+
+	if err := containerInfo.Container.Terminate(ctx); err != nil {
+		containerInfo.Status = StatusError
+		return fmt.Errorf("failed to stop container %s: %w", name, err)
+	}
+
+	containerInfo.Status = StatusStopped
+	delete(cm.containers, name)
+
+	cm.logger.Info("Container stopped successfully", zap.String("name", name))
+	return nil
+}
+
+func (cm *ContainerManager) StopAll(ctx context.Context) error {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+
+	for name := range cm.containers {
+		if err := cm.stopContainerUnsafe(ctx, name); err != nil {
+			cm.logger.Error("Failed to stop container",
+				zap.String("name", name),
+				zap.Error(err))
+		}
+	}
+
+	return nil
+}
+
+func (cm *ContainerManager) buildContainerRequest(cfg config.ContainerConfig) (*testcontainers.ContainerRequest, error) {
+	exposedPorts := make([]string, len(cfg.Ports))
+	for i, port := range cfg.Ports {
+		exposedPorts[i] = fmt.Sprintf("%d/tcp", port)
+	}
+
+	req := &testcontainers.ContainerRequest{
+		Image:        cfg.Image,
+		ExposedPorts: exposedPorts,
+		Env:          cfg.Environment,
+		Cmd:          cfg.Cmd,
+	}
+
+	if cfg.WaitFor.Port > 0 {
+		port, err := nat.NewPort("tcp", fmt.Sprint(cfg.WaitFor.Port))
+		if cfg.WaitFor.Path != "" {
+			if err != nil {
+				return nil, err
+
+			}
+			req.WaitingFor = wait.ForHTTP(cfg.WaitFor.Path).WithPort(port)
+		} else {
+			req.WaitingFor = wait.ForListeningPort(port)
+		}
+	}
+
+	return req, nil
+}
+
+func (cm *ContainerManager) stopContainerUnsafe(ctx context.Context, name string) error {
+	containerInfo := cm.containers[name]
+	containerInfo.Status = StatusStopping
+
+	cm.health.DeregisterContainer(name)
+
+	if err := containerInfo.Container.Terminate(ctx); err != nil {
+		containerInfo.Status = StatusError
+		return err
+	}
+
+	delete(cm.containers, name)
+	return nil
+}
+
+
+// File: pkg/containers/registry.go
+package containers
+
+import (
+	"sync"
+
+	"github.com/thegenem0/glocal/pkg/config"
+)
+
+type ContainerRegistry struct {
+	definitions map[string]config.ContainerConfig
+	mu          sync.RWMutex
+}
+
+func NewContainerRegistry() *ContainerRegistry {
+	return &ContainerRegistry{
+		definitions: make(map[string]config.ContainerConfig),
+	}
+}
+
+func (cr *ContainerRegistry) Register(name string, cfg config.ContainerConfig) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	cr.definitions[name] = cfg
+}
+
+func (cr *ContainerRegistry) Get(name string) (config.ContainerConfig, bool) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	cfg, exists := cr.definitions[name]
+	return cfg, exists
+}
+
+func (cr *ContainerRegistry) List() map[string]config.ContainerConfig {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	result := make(map[string]config.ContainerConfig)
+	for name, cfg := range cr.definitions {
+		result[name] = cfg
+	}
+
+	return result
+}
+
+func (cr *ContainerRegistry) LoadFromConfig(containers map[string]config.ContainerConfig) {
+	cr.mu.Lock()
+	defer cr.mu.Unlock()
+
+	for name, cfg := range containers {
+		cr.definitions[name] = cfg
+	}
+}
+
+
+// File: pkg/services/storage/translator.go
+package storage
+
+import (
+	"net/http"
+	"strings"
+
+	"go.uber.org/zap"
+)
+
+type APITranslator struct {
+	logger *zap.Logger
+}
+
+func NewAPITranslator(logger *zap.Logger) *APITranslator {
+	return &APITranslator{
+		logger: logger,
+	}
+}
+
+func (t *APITranslator) TranslateRequest(r *http.Request) error {
+	origPath := r.URL.Path
+
+	switch {
+	case strings.HasPrefix(r.URL.Path, "/storage/v1/b/"):
+		t.translateBucketAPI(r)
+	case strings.HasPrefix(r.URL.Path, "/upload/storage/v1/b/"):
+		t.translateUploadAPI(r)
+
+	case strings.HasPrefix(r.URL.Path, "/batch/storage/v1/"):
+		t.translateBatchAPI(r)
+
+	default:
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/storage")
+	}
+
+	t.translateHeaders(r)
+
+	t.logger.Debug("Request translated",
+		zap.String("original_path", origPath),
+		zap.String("translated_path", r.URL.Path))
+
+	return nil
+}
+
+func (t *APITranslator) translateBucketAPI(r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/storage/v1/b/")
+	parts := strings.SplitN(path, "/", 3)
+
+	if len(parts) >= 1 {
+		bucketName := parts[0]
+
+		if len(parts) >= 3 && parts[1] == "o" {
+			objectName := parts[2]
+			r.URL.Path = "/" + bucketName + "/" + objectName
+		} else {
+			r.URL.Path = "/" + bucketName
+		}
+	}
+}
+
+func (t *APITranslator) translateUploadAPI(r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/upload/storage/v1/b")
+	parts := strings.SplitN(path, "/", 2)
+
+	if len(parts) >= 1 {
+		bucketName := parts[0]
+		r.URL.Path = "/" + bucketName + "/"
+	}
+}
+
+func (t *APITranslator) translateBatchAPI(r *http.Request) {
+	r.URL.Path = strings.TrimPrefix(r.URL.Path, "/batch/storage/v1")
+}
+
+func (t *APITranslator) translateHeaders(r *http.Request) {
+	r.Header.Del("X-Goog-API-Key")
+	r.Header.Del("X-Goog-User-Project")
+
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		r.Header.Del("Authorization")
+	}
+}
+
+
+// File: pkg/services/storage/service.go
+package storage
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+
+	"github.com/thegenem0/glocal/pkg/config"
+	"github.com/thegenem0/glocal/pkg/containers"
+	"github.com/thegenem0/glocal/pkg/services/base"
+	"go.uber.org/zap"
+)
+
+type StorageService struct {
+	*base.ContainerService
+	proxy      *httputil.ReverseProxy
+	translator *APITranslator
+}
+
+func NewStorageService(
+	containerMgr *containers.ContainerManager,
+	containerConfig config.ContainerConfig,
+	logger *zap.Logger,
+) *StorageService {
+	contaierService := base.NewContainerServcie(
+		"storage",
+		"minio",
+		containerConfig,
+		containerMgr,
+		logger,
+	)
+
+	service := &StorageService{
+		ContainerService: contaierService,
+		translator:       NewAPITranslator(logger),
+	}
+
+	service.SetRoutes([]string{
+		"/storage/*path",
+		"/upload/storage/*path",
+		"/batch/storage/*path",
+	})
+
+	return service
+}
+
+func (s *StorageService) Initialize(ctx context.Context) error {
+	if err := s.ContainerService.Initialize(ctx); err != nil {
+		return err
+	}
+
+	minioEndpoint, err := s.GetContainerEndpoint(9000)
+	if err != nil {
+		return fmt.Errorf("failed to get MinIO endpoint: %w", err)
+
+	}
+
+	// s.logger.Info("MinIO endpoint ready", zap.String("endpoint", minioEndpoint))
+
+	target, err := url.Parse(minioEndpoint)
+	if err != nil {
+		return fmt.Errorf("failed to parse MinIO URL: %w", err)
+	}
+
+	s.proxy = httputil.NewSingleHostReverseProxy(target)
+	s.proxy.Director = s.createProxyDirector(target)
+	s.proxy.ErrorHandler = s.proxyErrorHandler
+
+	return nil
+}
+
+func (s *StorageService) Handler() http.Handler {
+	return http.HandlerFunc(s.handleRequest)
+}
+
+func (s *StorageService) handleRequest(w http.ResponseWriter, r *http.Request) {
+	// s.logger.Debug("Handling storage request",
+	// 	zap.String("method", r.Method),
+	// 	zap.String("path", r.URL.Path),
+	// 	zap.String("query", r.URL.RawQuery))
+
+	if err := s.translator.TranslateRequest(r); err != nil {
+		//s.logger.Error("Failed to translate request", zap.Error(err))
+		http.Error(w, "Failed to translate request", http.StatusInternalServerError)
+		return
+	}
+
+	s.proxy.ServeHTTP(w, r)
+}
+
+func (s *StorageService) createProxyDirector(target *url.URL) func(*http.Request) {
+	return func(r *http.Request) {
+		r.URL.Scheme = target.Scheme
+		r.URL.Host = target.Host
+
+		r.URL.Path = strings.TrimPrefix(r.URL.Path, "/storage")
+		if r.URL.Path == "" {
+			r.URL.Path = "/"
+		}
+	}
+}
+
+func (s *StorageService) proxyErrorHandler(w http.ResponseWriter, r *http.Request, err error) {
+	// s.logger.Error("Proxy error", zap.Error(err))
+	http.Error(w, "Service temporarily unavailable", http.StatusServiceUnavailable)
+}
+
+
+// File: pkg/services/base/container_service.go
+package base
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/thegenem0/glocal/pkg/config"
+	"github.com/thegenem0/glocal/pkg/containers"
+	"go.uber.org/zap"
+)
+
+type ContainerService struct {
+	*BaseService
+	containerName   string
+	containerConfig config.ContainerConfig
+	containerInfo   *containers.ContainerInfo
+}
+
+func NewContainerServcie(
+	name string,
+	containerName string,
+	containerConfig config.ContainerConfig,
+	containerMgr *containers.ContainerManager,
+	logger *zap.Logger,
+) *ContainerService {
+	return &ContainerService{
+		BaseService:     NewBaseService(name, containerMgr, logger),
+		containerName:   containerName,
+		containerConfig: containerConfig,
+	}
+}
+
+func (cs *ContainerService) Initialize(ctx context.Context) error {
+	cs.logger.Info("Initializing container service",
+		zap.String("service", cs.name),
+		zap.String("container", cs.containerName))
+
+	containerInfo, err := cs.containerMgr.StartContainer(ctx, cs.containerName, cs.containerConfig)
+	if err != nil {
+		return fmt.Errorf("failed to start container %s: %w", cs.containerName, err)
+	}
+
+	cs.containerInfo = containerInfo
+
+	cs.logger.Info("Container service initialized successfully",
+		zap.String("service", cs.name),
+		zap.String("container", cs.containerName),
+		zap.String("host", containerInfo.Host),
+		zap.Any("ports", containerInfo.Ports))
+
+	return nil
+}
+
+func (cs *ContainerService) Stop(ctx context.Context) error {
+	cs.logger.Info("Stopping container service",
+		zap.String("service", cs.name),
+		zap.String("container", cs.containerName))
+
+	if err := cs.containerMgr.StopContainer(ctx, cs.containerName); err != nil {
+		return fmt.Errorf("failed to stop container %s: %w", cs.containerName, err)
+	}
+
+	return nil
+}
+
+func (cs *ContainerService) Health(ctx context.Context) error {
+	if cs.containerInfo == nil {
+		return fmt.Errorf("container not initialized")
+	}
+
+	if cs.containerInfo.Status != containers.StatusRunning {
+		return fmt.Errorf("container is not running: %s", cs.containerInfo.Status)
+	}
+
+	return nil
+}
+
+func (cs *ContainerService) GetContainerEndpoint(internalPort int) (string, error) {
+	if cs.containerInfo == nil {
+		return "", fmt.Errorf("container not initialized")
+	}
+
+	externalPort, exists := cs.containerInfo.Ports[internalPort]
+	if !exists {
+		return "", fmt.Errorf("port %d not found", internalPort)
+	}
+
+	return fmt.Sprintf("http://%s:%d", cs.containerInfo.Host, externalPort), nil
+}
+
+func (cs *ContainerService) GetContainer() *containers.ContainerInfo {
+	return cs.containerInfo
+}
+
+
+// File: pkg/services/base/base.go
+package base
+
+import (
+	"context"
+	"net/http"
+
+	"github.com/thegenem0/glocal/pkg/containers"
+	"go.uber.org/zap"
+)
+
+type BaseService struct {
+	name         string
+	containerMgr *containers.ContainerManager
+	logger       *zap.Logger
+	routes       []string
+}
+
+func NewBaseService(name string, containerMgr *containers.ContainerManager, logger *zap.Logger) *BaseService {
+	return &BaseService{
+		name:         name,
+		containerMgr: containerMgr,
+		logger:       logger,
+		routes:       []string{},
+	}
+}
+
+func (bs *BaseService) Name() string {
+	return bs.name
+}
+
+func (bs *BaseService) Routes() []string {
+	return bs.routes
+}
+
+func (bs *BaseService) SetRoutes(routes []string) {
+	bs.routes = routes
+}
+
+func (bs *BaseService) Initialize(ctx context.Context) error {
+	bs.logger.Info("Initializing base service", zap.String("service", bs.name))
+	return nil
+}
+
+func (bs *BaseService) Start(ctx context.Context) error {
+	bs.logger.Info("Starting base service", zap.String("service", bs.name))
+	return nil
+}
+
+func (bs *BaseService) Stop(ctx context.Context) error {
+	bs.logger.Info("Stopping base service", zap.String("service", bs.name))
+	return nil
+}
+
+func (bs *BaseService) Health(ctx context.Context) error {
+	return nil
+}
+
+func (bs *BaseService) Handler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotImplemented)
+		_, _ = w.Write([]byte("Service not implemented"))
+	})
+}
+
+
+// File: pkg/runtime/service.go
+package runtime
+
+import (
+	"context"
+	"net/http"
+)
+
+type Service interface {
+	// Returns the service name (e.g. "storage", "bigquery")
+	Name() string
+
+	// Initializes the service and its dependencies
+	Initialize(ctx context.Context) error
+
+	// Starts the service
+	Start(ctx context.Context) error
+
+	// Gracefully shuts down service
+	Stop(ctx context.Context) error
+
+	// Returns the service's health status
+	Health(ctx context.Context) error
+
+	// Returns the http handler for this service
+	Handler() http.Handler
+
+	// Returns all the url patterns this service handles
+	Routes() []string
+}
+
+// Manages all registered services
+type ServiceRegistry struct {
+	services map[string]Service
+}
+
+func NewServiceRegistry() *ServiceRegistry {
+	return &ServiceRegistry{
+		services: make(map[string]Service),
+	}
+}
+
+func (sr *ServiceRegistry) Register(service Service) {
+	sr.services[service.Name()] = service
+}
+
+func (sr *ServiceRegistry) Get(name string) (Service, bool) {
+	service, exists := sr.services[name]
+	return service, exists
+}
+
+func (sr *ServiceRegistry) All() map[string]Service {
+	return sr.services
+}
+
+
+// File: pkg/runtime/server.go
+package runtime
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/thegenem0/glocal/pkg/containers"
+	"go.uber.org/zap"
+)
+
+type Server struct {
+	router       *gin.Engine
+	registry     *ServiceRegistry
+	containerMgr *containers.ContainerManager
+	logger       *zap.Logger
+	port         int
+}
+
+func NewServer(port int, logger *zap.Logger) *Server {
+	gin.SetMode(gin.ReleaseMode)
+	router := gin.New()
+	router.Use(gin.Recovery())
+
+	return &Server{
+		router:       router,
+		registry:     NewServiceRegistry(),
+		containerMgr: containers.NewContainerManager(logger),
+		logger:       logger,
+		port:         port,
+	}
+}
+
+func (s *Server) RegisterService(service Service) {
+	s.registry.Register(service)
+
+	for _, route := range service.Routes() {
+		s.router.Any(route, gin.WrapH(service.Handler()))
+		// s.router.Any(route+"/*path", gin.WrapH(service.Handler()))
+
+	}
+}
+
+func (s *Server) GetContainerManager() *containers.ContainerManager {
+	return s.containerMgr
+}
+
+func (s *Server) Start(ctx context.Context) error {
+	s.logger.Info("Starting GLocal server", zap.Int("port", s.port))
+
+	for name, service := range s.registry.All() {
+		s.logger.Info("Initializing service", zap.String("service", name))
+
+		if err := service.Initialize(ctx); err != nil {
+			return fmt.Errorf("failed to initialize service %s: %w", name, err)
+		}
+	}
+
+	for name, service := range s.registry.All() {
+		s.logger.Info("Starting service", zap.String("service", name))
+
+		if err := service.Start(ctx); err != nil {
+			return fmt.Errorf("failed to start service %s: %w", name, err)
+		}
+	}
+
+	s.router.GET("/health", s.healthHandler)
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf(":%d", s.port),
+		Handler: s.router,
+	}
+
+	serverErr := make(chan error, 1)
+	go func() {
+		s.logger.Info("HTTP server listening", zap.String("addr", server.Addr))
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			serverErr <- err
+		}
+	}()
+
+	select {
+	case <-ctx.Done():
+		s.logger.Info("Shutting down server due to context cancellation")
+
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			s.logger.Error("Error during server shutdown", zap.Error(err))
+		}
+
+		for name, service := range s.registry.All() {
+			s.logger.Info("Stopping service", zap.String("service", name))
+			if err := service.Stop(shutdownCtx); err != nil {
+				s.logger.Error("Error stopping service",
+					zap.String("service", name),
+					zap.Error(err))
+			}
+		}
+
+		if err := s.containerMgr.StopAll(shutdownCtx); err != nil {
+			s.logger.Error("Error stopping containers", zap.Error(err))
+		}
+
+		return ctx.Err()
+
+	case err := <-serverErr:
+		return fmt.Errorf("server error: %w", err)
+	}
+}
+
+func (s *Server) healthHandler(c *gin.Context) {
+	ctx := c.Request.Context()
+	status := make(map[string]string)
+
+	for name, service := range s.registry.All() {
+		if err := service.Health(ctx); err != nil {
+			status[name] = "degraded: " + err.Error()
+		} else {
+			status[name] = "healthy"
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ok",
+		"services": status,
+	})
+}
+
+
+// File: pkg/config/config.go
+package config
+
+import "github.com/spf13/viper"
+
+type Config struct {
+	Server     ServerConfig               `mapstructure:"server"`
+	Services   map[string]ServiceConfig   `mapstructure:"services"`
+	Containers map[string]ContainerConfig `mapstructure:"containers"`
+}
+
+type ServerConfig struct {
+	Port int    `mapstructure:"port"`
+	Host string `mapstructure:"host"`
+}
+
+type ServiceConfig struct {
+	Enabled   bool           `mapstructure:"enabled"`
+	Container string         `mapstructure:"container"`
+	Config    map[string]any `mapstructure:"config"`
+}
+
+type ContainerConfig struct {
+	Image       string            `mapstructure:"image"`
+	Ports       []int             `mapstructure:"ports"`
+	Environment map[string]string `mapstructure:"environment"`
+	Cmd         []string          `mapstructure:"cmd"`
+	WaitFor     WaitForConfig     `mapstructure:"wait_for"`
+}
+
+type WaitForConfig struct {
+	Port int    `mapstructure:"port"`
+	Path string `mapstructure:"path"`
+}
+
+func LoadConfig(path string) (*Config, error) {
+	vi := viper.GetViper()
+	vi.SetConfigFile(path)
+	vi.SetConfigType("yaml")
+
+	vi.SetDefault("server.port", 8080)
+	vi.SetDefault("server.host", "localhost")
+
+	if err := vi.ReadInConfig(); err != nil {
+		return nil, err
+	}
+
+	var config Config
+	if err := vi.Unmarshal(&config); err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+
+// File: cmd/glocal/main.go
+package main
+
+import (
+	"context"
+	"flag"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+
+	"github.com/thegenem0/glocal/pkg/config"
+	"github.com/thegenem0/glocal/pkg/runtime"
+	"github.com/thegenem0/glocal/pkg/services/storage"
+	"go.uber.org/zap"
+)
+
+func main() {
+	var configPath = flag.String("config", "configs/default.yaml", "Path to configuration file")
+	flag.Parse()
+
+	logger, err := zap.NewDevelopment()
+	if err != nil {
+		log.Fatal("Failed to initialize logger:", err)
+	}
+	defer logger.Sync()
+
+	cfg, err := config.LoadConfig(*configPath)
+	if err != nil {
+		logger.Fatal("Failed to load configuration", zap.Error(err))
+	}
+
+	server := runtime.NewServer(cfg.Server.Port, logger)
+
+	// TODO(thegenem0):
+	// Register services based on config
+
+	if err := registerServices(server, cfg, logger); err != nil {
+		logger.Fatal("Failed to register services", zap.Error(err))
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		logger.Info("Shutdown signal received")
+		cancel()
+	}()
+
+	logger.Info("Starting GLocal server")
+	if err := server.Start(ctx); err != nil {
+		if err == context.Canceled {
+			logger.Info("Server shutdown completed")
+		} else {
+			logger.Fatal("Server failed to start", zap.Error(err))
+		}
+	}
+
+	logger.Info("GLocal server stopped")
+}
+
+func registerServices(server *runtime.Server, cfg *config.Config, logger *zap.Logger) error {
+	containerMgr := server.GetContainerManager()
+
+	containerMgr.GetRegistry().LoadFromConfig(cfg.Containers)
+
+	if serviceConfig, exists := cfg.Services["storage"]; exists && serviceConfig.Enabled {
+		containerConfig, exists := cfg.Containers[serviceConfig.Container]
+		if !exists {
+			logger.Error("Container configuration not found",
+				zap.String("container", serviceConfig.Container))
+			return nil // Continue with other services
+		}
+
+		storageService := storage.NewStorageService(containerMgr, containerConfig, logger)
+		server.RegisterService(storageService)
+		logger.Info("Storage service registered")
+	}
+
+	return nil
+}
+
+

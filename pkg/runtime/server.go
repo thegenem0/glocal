@@ -38,7 +38,7 @@ func (s *Server) RegisterService(service Service) {
 
 	for _, route := range service.Routes() {
 		s.router.Any(route, gin.WrapH(service.Handler()))
-		s.router.Any(route+"/*path", gin.WrapH(service.Handler()))
+		// s.router.Any(route+"/*path", gin.WrapH(service.Handler()))
 
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/thegenem0/glocal/pkg/config"
 	"github.com/thegenem0/glocal/pkg/runtime"
+	"github.com/thegenem0/glocal/pkg/services/storage"
 	"go.uber.org/zap"
 )
 
@@ -33,6 +34,10 @@ func main() {
 	// TODO(thegenem0):
 	// Register services based on config
 
+	if err := registerServices(server, cfg, logger); err != nil {
+		logger.Fatal("Failed to register services", zap.Error(err))
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -55,4 +60,25 @@ func main() {
 	}
 
 	logger.Info("GLocal server stopped")
+}
+
+func registerServices(server *runtime.Server, cfg *config.Config, logger *zap.Logger) error {
+	containerMgr := server.GetContainerManager()
+
+	containerMgr.GetRegistry().LoadFromConfig(cfg.Containers)
+
+	if serviceConfig, exists := cfg.Services["storage"]; exists && serviceConfig.Enabled {
+		containerConfig, exists := cfg.Containers[serviceConfig.Container]
+		if !exists {
+			logger.Error("Container configuration not found",
+				zap.String("container", serviceConfig.Container))
+			return nil // Continue with other services
+		}
+
+		storageService := storage.NewStorageService(containerMgr, containerConfig, logger)
+		server.RegisterService(storageService)
+		logger.Info("Storage service registered")
+	}
+
+	return nil
 }

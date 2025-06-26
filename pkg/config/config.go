@@ -23,6 +23,7 @@ type ContainerConfig struct {
 	Image       string            `mapstructure:"image"`
 	Ports       []int             `mapstructure:"ports"`
 	Environment map[string]string `mapstructure:"environment"`
+	Cmd         []string          `mapstructure:"cmd"`
 	WaitFor     WaitForConfig     `mapstructure:"wait_for"`
 }
 

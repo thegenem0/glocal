@@ -18,11 +18,13 @@ containers:
   minio:
     image: "minio/minio:latest"
     ports: [9000, 9001]
+    cmd: ["server", "/data", "--console-address", ":9001"]
     environment:
       MINIO_ROOT_USER: "minioadmin"
       MINIO_ROOT_PASSWORD: "minioadmin"
     wait_for:
       port: 9000
+      path: "/minio/health/live"
   clickhouse:
     image: "clickhouse/clickhouse-server:latest"
     ports: [8123, 9000]
